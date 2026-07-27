@@ -11,7 +11,7 @@
       {
         "rule": "no-adjust-state-on-prop-change",
         "filePath": "src/components/form-elements/radio/RadioGroup.tsx",
-        "title": "State synced to a prop inside an effect"
+        "title": "State adjusted after a prop changes"
       },
       {
         "rule": "no-effect-chain",

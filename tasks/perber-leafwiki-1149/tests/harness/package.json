@@ -1,5 +1,5 @@
 {
-  "name": "leafwiki-shortcuts-controlled-verifier",
+  "name": "leafwiki-shortcuts-custom-test-harness",
   "private": true,
   "version": "0.0.0",
   "type": "module",

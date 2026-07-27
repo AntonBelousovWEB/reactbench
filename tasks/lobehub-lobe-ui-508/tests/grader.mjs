@@ -14,6 +14,8 @@ const config = JSON.parse(fs.readFileSync(path.join(TESTS_DIR, "config.json"), "
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 const DEFAULT_VERIFIER_TIMEOUT_SEC = 600;
 const REWARD_WRITE_MARGIN_MS = 20_000;
+const TELEMETRY_SCHEMA_VERSION = 1;
+const TELEMETRY_FILE_NAME = "otel-stages.jsonl";
 
 const GRADER_START_MS = Date.now();
 const VERIFIER_BUDGET_MS = (config.verifier_timeout_sec ?? DEFAULT_VERIFIER_TIMEOUT_SEC) * 1000;
@@ -25,6 +27,51 @@ const RD_STAGE_DEADLINE_MS = DEADLINE_MS - TEST_STAGE_RESERVE_MS;
 const remainingRdBudgetMs = () => Math.max(1000, RD_STAGE_DEADLINE_MS - Date.now());
 
 const gates = { testOk: false, rdOk: false };
+
+const appendTelemetryRecord = (record) => {
+  try {
+    fs.mkdirSync(VERIFIER_DIR, { recursive: true });
+    fs.appendFileSync(
+      path.join(VERIFIER_DIR, TELEMETRY_FILE_NAME),
+      `${JSON.stringify({
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        timestamp_unix_nano: String(BigInt(Date.now()) * 1_000_000n),
+        ...record,
+      })}\n`,
+    );
+  } catch {}
+};
+
+const initializeTelemetryFile = () => {
+  try {
+    fs.mkdirSync(VERIFIER_DIR, { recursive: true });
+    fs.writeFileSync(path.join(VERIFIER_DIR, TELEMETRY_FILE_NAME), "");
+  } catch {}
+};
+
+export const withTelemetryStage = (stage, operation, isSuccessful = (result) => result !== false) => {
+  const startedAt = process.hrtime.bigint();
+  appendTelemetryRecord({ event: "start", stage });
+  try {
+    const result = operation();
+    appendTelemetryRecord({
+      event: "end",
+      stage,
+      duration_ms: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+      ok: isSuccessful(result),
+    });
+    return result;
+  } catch (error) {
+    appendTelemetryRecord({
+      event: "end",
+      stage,
+      duration_ms: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+      ok: false,
+      error_type: error instanceof Error ? error.name : "UnknownError",
+    });
+    throw error;
+  }
+};
 
 export const calculateReward = ({ testOk, rdOk, isReactDoctorTelemetryOnly }) =>
   Number(testOk && (rdOk || isReactDoctorTelemetryOnly));
@@ -141,7 +188,9 @@ const syncAgentWorkspace = () => {
     // deletion under a build/dist/out dir from being silently reverted.
     restoreTransferDroppedSource(resolveBaseSha());
   }
-  sh(`bash ${JSON.stringify(path.join(TESTS_DIR, "pre-artifacts.sh"))}`, { env: { OUT_DIR: VERIFIER_DIR } });
+  withTelemetryStage("pre-artifacts", () =>
+    sh(`bash ${JSON.stringify(path.join(TESTS_DIR, "pre-artifacts.sh"))}`, { env: { OUT_DIR: VERIFIER_DIR } }),
+  );
   resetIgnoreRules();
   console.log("clean-room: restored pristine git metadata over agent workspace");
 };
@@ -583,10 +632,12 @@ const runRdGate = () => {
   // non-exec'd it survives the killed bash wrapper and keeps writing a
   // truncated report into the redirect.
   const runScan = (extraFlags, outputPath, errPath) =>
-    sh(
-      `exec react-doctor ${rdFlags} ${extraFlags} --json --json-compact ${JSON.stringify(scanDir)} ` +
-        `> ${JSON.stringify(outputPath)} 2>${JSON.stringify(errPath)}`,
-      { env: buildRdEnv(), timeoutMs: remainingRdBudgetMs() },
+    withTelemetryStage(extraFlags ? "rd-scan-changed" : "rd-scan", () =>
+      sh(
+        `exec react-doctor ${rdFlags} ${extraFlags} --json --json-compact ${JSON.stringify(scanDir)} ` +
+          `> ${JSON.stringify(outputPath)} 2>${JSON.stringify(errPath)}`,
+        { env: buildRdEnv(), timeoutMs: remainingRdBudgetMs() },
+      ),
     );
   const markRdInfra = (line) => {
     console.log(`RD-INFRA: ${line}`);
@@ -748,38 +799,48 @@ const runTestSuite = () => {
 const main = () => {
   fs.mkdirSync(VERIFIER_DIR, { recursive: true });
   process.chdir(APP_DIR);
-  syncAgentWorkspace();
-  resetProtectedFiles();
+  withTelemetryStage("sync-workspace", syncAgentWorkspace);
+  withTelemetryStage("reset-protected", resetProtectedFiles);
   const isHealthMode = config.rd.mode === "health";
   const hasHiddenSpec = fs.existsSync(path.join(TESTS_DIR, "test.patch"));
   if (isHealthMode) {
-    resetSpecSurface();
+    withTelemetryStage("reset-spec-surface", resetSpecSurface);
   } else {
-    if (config.reset_spec_surface) resetSpecSurface();
-    else resetTestSurface();
-    if (hasHiddenSpec) resetGradedSpecs();
+    if (config.reset_spec_surface) withTelemetryStage("reset-spec-surface", resetSpecSurface);
+    else withTelemetryStage("reset-test-surface", resetTestSurface);
+    if (hasHiddenSpec) withTelemetryStage("reset-graded-specs", resetGradedSpecs);
   }
-  if (!restoreNodeModules()) {
+  if (!withTelemetryStage("restore-node-modules", restoreNodeModules)) {
     console.log("FAIL: pristine dependency or post-restore setup failed");
     return;
   }
-  runRdGate();
+  withTelemetryStage("rd-gate", runRdGate, () => gates.rdOk);
   if (
     !isHealthMode &&
     hasHiddenSpec &&
-    !sh(`git apply --whitespace=nowarn ${JSON.stringify(path.join(TESTS_DIR, "test.patch"))}`)
+    !withTelemetryStage("apply-hidden-spec", () =>
+      sh(`git apply --whitespace=nowarn ${JSON.stringify(path.join(TESTS_DIR, "test.patch"))}`),
+    )
   ) {
     console.log("FAIL: hidden spec patch did not apply cleanly (failing closed)");
     return;
   }
-  if (!runPreTestBuild()) return;
-  runTestSuite();
+  if (!withTelemetryStage("pre-test-build", runPreTestBuild)) return;
+  withTelemetryStage("test-suite", runTestSuite, () => gates.testOk);
 };
 
 if (process.env.REACT_BENCH_GRADER_TEST !== "1") {
+  initializeTelemetryFile();
   try {
-    main();
+    withTelemetryStage(
+      "verifier",
+      main,
+      () => calculateReward({
+        ...gates,
+        isReactDoctorTelemetryOnly: config.rd.telemetry_only === true,
+      }) === 1,
+    );
   } finally {
-    writeReward();
+    withTelemetryStage("reward-write", writeReward);
   }
 }
