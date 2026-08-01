@@ -1,0 +1,9 @@
+"""JobStore protocol."""
+from typing import Protocol
+from ..core.models import Job
+
+
+class JobStore(Protocol):
+    async def list_all(self) -> list[Job]: ...
+    async def get(self, job_name: str) -> Job: ...
+    async def read_trial_artifact(self, job_name: str, trial_name: str, artifact_kind: str) -> str | None: ...
